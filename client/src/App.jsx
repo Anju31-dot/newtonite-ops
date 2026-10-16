@@ -55,6 +55,7 @@ function App() {
   const [members, setMembers] = useState([]);
   const [metrics, setMetrics] = useState({ open: 0, urgent: 0, inProgress: 0, awaitingApproval: 0 });
   const [pagination, setPagination] = useState({ page: 1, pageSize: 10, total: 0, totalPages: 0 });
+  const [sorting, setSorting] = useState({ sortBy: "updatedAt", order: "desc" });
   const [filters, setFilters] = useState({ ...initialFilters, teamId: "", assigneeId: "" });
   const [selected, setSelected] = useState(null);
   const [detail, setDetail] = useState(null);
@@ -68,10 +69,15 @@ function App() {
   const [editing, setEditing] = useState(false);
 
   const queryString = useMemo(() => {
-    const query = new URLSearchParams({ page: String(pagination.page), pageSize: String(pagination.pageSize), sortBy: "updatedAt", order: "desc" });
+    const query = new URLSearchParams({
+      page: String(pagination.page),
+      pageSize: String(pagination.pageSize),
+      sortBy: sorting.sortBy,
+      order: sorting.order
+    });
     Object.entries(filters).forEach(([key, value]) => { if (value) query.set(key, value); });
     return query.toString();
-  }, [filters, pagination.page, pagination.pageSize]);
+  }, [filters, pagination.page, pagination.pageSize, sorting]);
 
   const loadItems = useCallback(async () => {
     if (!token) return;
@@ -264,6 +270,17 @@ function App() {
               <select aria-label="Filter type" value={filters.type} onChange={(event) => setFilter("type", event.target.value)}><option value="">All types</option>{Object.entries(typeLabels).map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select>
               <select aria-label="Filter team" value={filters.teamId} onChange={(event) => setFilter("teamId", event.target.value)}><option value="">All teams</option>{teams.map((team) => <option key={team.id} value={team.id}>{team.name}</option>)}</select>
               <select aria-label="Filter assignee" value={filters.assigneeId} onChange={(event) => setFilter("assigneeId", event.target.value)}><option value="">All assignees</option>{members.map((member) => <option key={`${member.teamId}-${member.id}`} value={member.id}>{member.name}</option>)}</select>
+              <select aria-label="Sort work items" value={`${sorting.sortBy}:${sorting.order}`} onChange={(event) => {
+                const [sortBy, order] = event.target.value.split(":");
+                setSorting({ sortBy, order });
+                setPagination((current) => ({ ...current, page: 1 }));
+              }}>
+                <option value="updatedAt:desc">Recently updated</option>
+                <option value="createdAt:desc">Newest created</option>
+                <option value="createdAt:asc">Oldest created</option>
+                <option value="dueDate:asc">Due date soonest</option>
+                <option value="priority:desc">Highest priority</option>
+              </select>
             </div>
             {error && <div className="notice error">{error}<button onClick={loadItems}>Retry</button></div>}
             <div className="table-wrap"><table><thead><tr><th>WORK ITEM</th><th>PRIORITY</th><th>STATUS</th><th>ASSIGNEE</th><th>DUE DATE</th><th /></tr></thead>

@@ -163,13 +163,14 @@ export function createWorkItemRouter(prisma) {
     const current = await getAccessibleItem(request.user.id, request.params.id);
     const teamMembership = await membership(request.user.id, current.teamId);
     const { version, status } = request.validated.body;
+    if (!editableRoles.includes(teamMembership.role)) throw new HttpError(403, "Your team role cannot change workflow status.", "FORBIDDEN");
+    if (version !== current.version) throw new HttpError(409, "This item changed since you opened it. Reload and try again.", "STALE_VERSION");
     if (status === "RESOLVED" && current.status === "AWAITING_APPROVAL" && !["LEAD", "ADMIN"].includes(teamMembership.role)) {
       throw new HttpError(403, "Only a team Lead or Admin may approve this item.", "FORBIDDEN");
     }
     if (!transitions[current.status].includes(status)) {
       throw new HttpError(400, `Cannot move an item from ${current.status} to ${status}.`, "INVALID_TRANSITION");
     }
-    if (!editableRoles.includes(teamMembership.role)) throw new HttpError(403, "Your team role cannot change workflow status.", "FORBIDDEN");
     const updated = await prisma.$transaction(async (tx) => {
       const result = await tx.workItem.updateMany({
         where: { id: current.id, version },

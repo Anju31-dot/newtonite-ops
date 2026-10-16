@@ -14,7 +14,8 @@ A small internal operations workspace for teams to create, assign, prioritize, a
 - [x] Mocked API tests for authentication, team access, approval authorization, invalid transitions, stale versions, and competing claim requests.
 - [x] Opt-in PostgreSQL-backed integration tests for cross-team access, role enforcement, workflow, stale versions, and competing claims.
 - [x] Setup and decision documentation.
-- [ ] Run against a live PostgreSQL database, execute migrations/seed, and verify the browser workflow end to end. This environment has Node.js 24/npm 11, but does not have Docker/Compose or `psql`; install/start PostgreSQL (or install Docker Desktop) to complete these checks.
+- [x] Run the checked-in migration and demo seed against local PostgreSQL; run all five PostgreSQL integration tests against a separate disposable database.
+- [ ] Verify the browser workflow end to end. The automated API tests do not replace a manual browser walkthrough.
 
 ## Prerequisites
 
@@ -147,17 +148,23 @@ The integration suite creates uniquely named users, teams, memberships, and item
 
 Checked on 16 October 2026:
 
-- `npm test`: server mocked route tests **16 passed**; PostgreSQL integration tests **5 skipped** because `TEST_DATABASE_URL` is unavailable; client tests **2 passed**.
+- `npx prisma validate`: passed.
+- `npm run db:migrate` against the local demo database: passed; migration `20261016000000_init` applied.
+- `npm run db:seed` against the local demo database: passed; verified 5 users, 2 teams, and 5 work items.
+- `npm run db:migrate` against the separately created local test database: passed.
+- `npm run test --workspace=server -- postgres.integration.test.js`: **5 passed** against the isolated PostgreSQL test database, including two concurrent claim requests.
+- `npm test`: **29 server tests passed** (24 mocked API tests and 5 PostgreSQL integration tests), **2 client tests passed**, none skipped.
 - `npm run build`: passed.
 - `npm run db:generate`: passed.
-- `npx prisma validate`: passed.
 - `npm audit --audit-level=moderate`: zero reported vulnerabilities.
-- PostgreSQL migration/seed, live API workflow, PostgreSQL race behavior, and browser end-to-end behavior: **not run**. Docker and PostgreSQL are unavailable in the checked workspace.
+- Mocked coverage includes database lookup failures returning sanitized `500` errors, stale workflow updates returning `409`, database query construction for search and filters, priority/assignment activity recording, comment creation and timeline reads, and database-independent health checks. Mock tests do not establish database transaction or concurrency behavior.
+- The integration suite created uniquely named records and removed them; post-test counts in the disposable test database were zero users, zero teams, and zero work items. The test database itself remains in the local Docker volume.
+- Browser end-to-end workflow: **not run**.
 
 ## Known limitations
 
 - No production identity provider, password reset, self-registration, or persistent server-side session revocation.
 - No user-facing team administration or team-creation screen; seed data defines the demo teams and membership roles.
 - No comment idempotency key; a deliberate/retried comment POST creates another comment.
-- At the latest environment check, Docker/Compose and PostgreSQL client/server tools were not found, and `127.0.0.1:5432` did not accept a connection. No migration, seed, PostgreSQL integration test, real database concurrency, or browser end-to-end run has been performed.
+- Browser end-to-end workflow has not been verified. PostgreSQL-backed API tests passed against local Docker PostgreSQL bound to `127.0.0.1:5432`; a manual browser walkthrough remains to be done.
 - The documented seed-password fallback and Compose database credentials are local-demo defaults only. Override them through environment variables and never reuse them for a deployed or sensitive database.

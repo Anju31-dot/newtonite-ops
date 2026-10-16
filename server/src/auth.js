@@ -28,22 +28,28 @@ export function createAuth(prisma) {
   }
 
   async function authenticate(request, _response, next) {
+    let payload;
     try {
       const value = request.get("authorization");
       if (!value?.startsWith("Bearer ")) throw new HttpError(401, "Sign in to continue.", "UNAUTHENTICATED");
-      const payload = jwt.verify(value.slice(7), getJwtSecret(), { algorithms: ["HS256"] });
+      payload = jwt.verify(value.slice(7), getJwtSecret(), { algorithms: ["HS256"] });
       if (typeof payload === "string" || typeof payload.sub !== "string" || payload.sub.length === 0) {
         throw new HttpError(401, "Your session is invalid or expired.", "UNAUTHENTICATED");
       }
+    } catch (error) {
+      return next(error instanceof HttpError ? error : new HttpError(401, "Your session is invalid or expired.", "UNAUTHENTICATED"));
+    }
+
+    try {
       const user = await prisma.user.findUnique({
         where: { id: payload.sub },
         select: { id: true, name: true, email: true }
       });
       if (!user) throw new HttpError(401, "Your account is no longer available.", "UNAUTHENTICATED");
       request.user = user;
-      next();
+      return next();
     } catch (error) {
-      next(error instanceof HttpError ? error : new HttpError(401, "Your session is invalid or expired.", "UNAUTHENTICATED"));
+      return next(error);
     }
   }
 

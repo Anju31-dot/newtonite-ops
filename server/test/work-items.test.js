@@ -79,6 +79,14 @@ describe("mocked API route tests — not PostgreSQL integration tests", () => {
     app = createApp(prisma);
   });
 
+  it("serves the liveness endpoint without requiring a database query", async () => {
+    const response = await request(app).get("/api/health");
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ status: "ok" });
+    expect(prisma.user.findUnique).not.toHaveBeenCalled();
+  });
+
   it("rejects requests without a valid authenticated account", async () => {
     const response = await request(app).get("/api/items/item-1");
     expect(response.status).toBe(401);
@@ -108,10 +116,44 @@ describe("mocked API route tests — not PostgreSQL integration tests", () => {
     }));
   });
 
+  it("passes search and supported filters to the database query", async () => {
+    const response = await request(app).get(
+      "/api/items?q=refund&status=OPEN&priority=URGENT&type=INCIDENT&teamId=team-ops&assigneeId=user-member"
+    ).set("Authorization", `Bearer ${tokenFor()}`);
+
+    expect(response.status).toBe(200);
+    expect(prisma.workItem.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        teamId: { equals: "team-ops" },
+        status: "OPEN",
+        priority: "URGENT",
+        type: "INCIDENT",
+        assigneeId: "user-member",
+        OR: [
+          { title: { contains: "refund", mode: "insensitive" } },
+          { description: { contains: "refund", mode: "insensitive" } }
+        ]
+      }
+    }));
+  });
+
   it("rejects a bearer token signed with a different secret", async () => {
     const forged = jwt.sign({ sub: user.id }, "attacker-controlled-secret-that-is-long-enough");
     const response = await request(app).get("/api/items/item-1").set("Authorization", `Bearer ${forged}`);
     expect(response.status).toBe(401);
+  });
+
+  it("returns a sanitized server error when the database cannot load the authenticated user", async () => {
+    const logError = vi.spyOn(console, "error").mockImplementation(() => {});
+    prisma.user.findUnique.mockRejectedValue(new Error("database connection details"));
+
+    const response = await request(app).get("/api/items/item-1")
+      .set("Authorization", `Bearer ${tokenFor()}`);
+
+    expect(response.status).toBe(500);
+    expect(response.body.code).toBe("INTERNAL_ERROR");
+    expect(JSON.stringify(response.body)).not.toContain("database connection details");
+    expect(logError).toHaveBeenCalledOnce();
   });
 
   it("does not trust a role claim in a valid JWT over the database membership", async () => {
@@ -205,6 +247,39 @@ describe("mocked API route tests — not PostgreSQL integration tests", () => {
     expect(prisma.comment.create).not.toHaveBeenCalled();
   });
 
+  it("creates a comment for the authenticated actor on an accessible item", async () => {
+    const response = await request(app).post("/api/items/item-1/comments")
+      .set("Authorization", `Bearer ${tokenFor()}`)
+      .send({ body: "I have started investigating." });
+
+    expect(response.status).toBe(201);
+    expect(prisma.comment.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: { itemId: "item-1", authorId: user.id, body: "I have started investigating." }
+    }));
+  });
+
+  it("returns item activity and comments in chronological order", async () => {
+    const activity = { id: "activity-1", action: "priority_changed" };
+    const comment = { id: "comment-1", body: "Investigation started." };
+    prisma.activity.findMany.mockResolvedValue([activity]);
+    prisma.comment.findMany.mockResolvedValue([comment]);
+
+    const response = await request(app).get("/api/items/item-1")
+      .set("Authorization", `Bearer ${tokenFor()}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.activities).toEqual([activity]);
+    expect(response.body.comments).toEqual([comment]);
+    expect(prisma.activity.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { itemId: "item-1" },
+      orderBy: { createdAt: "asc" }
+    }));
+    expect(prisma.comment.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { itemId: "item-1" },
+      orderBy: { createdAt: "asc" }
+    }));
+  });
+
   it("blocks Viewer create, edit, assignment, claim, and status actions", async () => {
     prisma = makePrisma({ role: "VIEWER" });
     app = createApp(prisma);
@@ -233,6 +308,56 @@ describe("mocked API route tests — not PostgreSQL integration tests", () => {
       .send({ title: "Updated incident", version: 1 });
     expect(response.status).toBe(409);
     expect(response.body.code).toBe("STALE_VERSION");
+  });
+
+  it("returns 409 for a stale status update before validating the old workflow state", async () => {
+    prisma.state.item.status = "IN_PROGRESS";
+    prisma.state.item.version = 2;
+    prisma.workItem.findUnique.mockImplementation(async () => ({ ...prisma.state.item }));
+
+    const response = await request(app).patch("/api/items/item-1/status")
+      .set("Authorization", `Bearer ${tokenFor()}`)
+      .send({ status: "CLOSED", version: 1 });
+
+    expect(response.status).toBe(409);
+    expect(response.body.code).toBe("STALE_VERSION");
+    expect(prisma.workItem.updateMany).not.toHaveBeenCalled();
+    expect(prisma.activity.create).not.toHaveBeenCalled();
+  });
+
+  it("records a priority change in the same transaction as the versioned update", async () => {
+    const response = await request(app).patch("/api/items/item-1")
+      .set("Authorization", `Bearer ${tokenFor()}`)
+      .send({ priority: "HIGH", version: 1 });
+
+    expect(response.status).toBe(200);
+    expect(response.body.item.priority).toBe("HIGH");
+    expect(prisma.$transaction).toHaveBeenCalledOnce();
+    expect(prisma.activity.create).toHaveBeenCalledWith({
+      data: {
+        itemId: "item-1",
+        actorId: user.id,
+        action: "priority_changed",
+        details: { from: "URGENT", to: "HIGH" }
+      }
+    });
+  });
+
+  it("records assignment activity with the actor and new assignee", async () => {
+    const response = await request(app).patch("/api/items/item-1/assignment")
+      .set("Authorization", `Bearer ${tokenFor()}`)
+      .send({ assigneeId: secondUser.id, version: 1 });
+
+    expect(response.status).toBe(200);
+    expect(prisma.$transaction).toHaveBeenCalledOnce();
+    expect(prisma.activity.create).toHaveBeenCalledWith({
+      data: {
+        itemId: "item-1",
+        actorId: user.id,
+        action: "assigned",
+        details: { from: null, to: secondUser.name }
+      }
+    });
   });
 
   it("simulates two concurrent claim requests with a mocked database", async () => {
