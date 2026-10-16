@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      # Defaults are for a local demo only. Override with a root .env file.
+      POSTGRES_USER: ${POSTGRES_USER:-ops_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-operations_under_pressure}
+    ports:
+      - "5432:5432"
+    volumes:
+      - operations-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ops_user} -d ${POSTGRES_DB:-operations_under_pressure}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  operations-postgres:
