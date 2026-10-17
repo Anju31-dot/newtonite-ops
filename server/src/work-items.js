@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { HttpError } from "./errors.js";
+import { runIdempotently } from "./idempotency.js";
 import { schemas, validate } from "./validation.js";
 
 const includeDetails = {
@@ -97,7 +98,12 @@ export function createWorkItemRouter(prisma) {
     if (data.assigneeId) {
       await membership(data.assigneeId, data.teamId);
     }
-    const item = await prisma.$transaction(async (tx) => {
+    const item = await runIdempotently(prisma, {
+      actorId: request.user.id,
+      scope: "POST /items",
+      key: request.get("Idempotency-Key"),
+      payload: data
+    }, async (tx) => {
       const created = await tx.workItem.create({
         data: {
           ...data,
@@ -120,7 +126,7 @@ export function createWorkItemRouter(prisma) {
     response.status(201).json({ item });
   });
 
-  router.get("/:id", async (request, response) => {
+  router.get("/:id", validate(schemas.itemId, "params"), async (request, response) => {
     const item = await getAccessibleItem(request.user.id, request.params.id);
     const [activities, comments] = await Promise.all([
       prisma.activity.findMany({
@@ -137,7 +143,7 @@ export function createWorkItemRouter(prisma) {
     response.json({ item, activities, comments });
   });
 
-  router.patch("/:id", validate(schemas.update), async (request, response) => {
+  router.patch("/:id", validate(schemas.itemId, "params"), validate(schemas.update), async (request, response) => {
     const current = await getAccessibleItem(request.user.id, request.params.id);
     const teamMembership = await membership(request.user.id, current.teamId);
     if (!editableRoles.includes(teamMembership.role)) throw new HttpError(403, "Your team role cannot edit work items.", "FORBIDDEN");
@@ -149,9 +155,19 @@ export function createWorkItemRouter(prisma) {
         data: { ...data, version: { increment: 1 } }
       });
       if (update.count !== 1) throw new HttpError(409, "This item changed since you opened it. Reload and try again.", "STALE_VERSION");
-      if (data.priority !== undefined && data.priority !== current.priority) {
+      for (const [field, value] of Object.entries(data)) {
+        if (value === undefined) continue;
+        const previous = current[field] ?? null;
+        const next = value instanceof Date ? value.toISOString() : value;
+        const previousValue = previous instanceof Date ? previous.toISOString() : previous;
+        if (next === previousValue) continue;
         await tx.activity.create({
-          data: { itemId: current.id, actorId: request.user.id, action: "priority_changed", details: { from: current.priority, to: data.priority } }
+          data: {
+            itemId: current.id,
+            actorId: request.user.id,
+            action: `${field === "dueDate" ? "due_date" : field}_changed`,
+            details: field === "description" ? { field } : { from: previousValue, to: next }
+          }
         });
       }
       return tx.workItem.findUnique({ where: { id: current.id }, include: includeDetails });
@@ -159,7 +175,7 @@ export function createWorkItemRouter(prisma) {
     response.json({ item: result });
   });
 
-  router.patch("/:id/status", validate(schemas.status), async (request, response) => {
+  router.patch("/:id/status", validate(schemas.itemId, "params"), validate(schemas.status), async (request, response) => {
     const current = await getAccessibleItem(request.user.id, request.params.id);
     const teamMembership = await membership(request.user.id, current.teamId);
     const { version, status } = request.validated.body;
@@ -185,7 +201,7 @@ export function createWorkItemRouter(prisma) {
     response.json({ item: updated });
   });
 
-  router.patch("/:id/assignment", validate(schemas.assignment), async (request, response) => {
+  router.patch("/:id/assignment", validate(schemas.itemId, "params"), validate(schemas.assignment), async (request, response) => {
     const current = await getAccessibleItem(request.user.id, request.params.id);
     const teamMembership = await membership(request.user.id, current.teamId);
     if (!editableRoles.includes(teamMembership.role)) throw new HttpError(403, "Your team role cannot assign work items.", "FORBIDDEN");
@@ -197,23 +213,25 @@ export function createWorkItemRouter(prisma) {
         data: { assigneeId, version: { increment: 1 } }
       });
       if (result.count !== 1) throw new HttpError(409, "This item changed since you opened it. Reload and try again.", "STALE_VERSION");
-      await tx.activity.create({
-        data: {
-          itemId: current.id,
-          actorId: request.user.id,
-          action: "assigned",
-          details: {
-            from: current.assignee?.name || null,
-            to: assigneeId ? (await tx.user.findUnique({ where: { id: assigneeId }, select: { name: true } })).name : null
+      if (current.assigneeId !== assigneeId) {
+        await tx.activity.create({
+          data: {
+            itemId: current.id,
+            actorId: request.user.id,
+            action: "assigned",
+            details: {
+              from: current.assignee?.name || null,
+              to: assigneeId ? (await tx.user.findUnique({ where: { id: assigneeId }, select: { name: true } })).name : null
+            }
           }
-        }
-      });
+        });
+      }
       return tx.workItem.findUnique({ where: { id: current.id }, include: includeDetails });
     });
     response.json({ item: assigned });
   });
 
-  router.post("/:id/claim", async (request, response) => {
+  router.post("/:id/claim", validate(schemas.itemId, "params"), async (request, response) => {
     const current = await getAccessibleItem(request.user.id, request.params.id);
     const teamMembership = await membership(request.user.id, current.teamId);
     if (!editableRoles.includes(teamMembership.role)) throw new HttpError(403, "Your team role cannot claim work items.", "FORBIDDEN");
@@ -231,14 +249,20 @@ export function createWorkItemRouter(prisma) {
     response.json({ item: claimed });
   });
 
-  router.post("/:id/comments", validate(schemas.comment), async (request, response) => {
+  router.post("/:id/comments", validate(schemas.itemId, "params"), validate(schemas.comment), async (request, response) => {
     const item = await getAccessibleItem(request.user.id, request.params.id);
     const teamMembership = await membership(request.user.id, item.teamId);
     if (!editableRoles.includes(teamMembership.role)) throw new HttpError(403, "Your team role cannot comment on work items.", "FORBIDDEN");
-    const comment = await prisma.comment.create({
-      data: { itemId: item.id, authorId: request.user.id, body: request.validated.body.body },
+    const input = request.validated.body;
+    const comment = await runIdempotently(prisma, {
+      actorId: request.user.id,
+      scope: `POST /items/${item.id}/comments`,
+      key: request.get("Idempotency-Key"),
+      payload: input
+    }, (tx) => tx.comment.create({
+      data: { itemId: item.id, authorId: request.user.id, body: input.body },
       include: { author: { select: { id: true, name: true } } }
-    });
+    }));
     response.status(201).json({ comment });
   });
 

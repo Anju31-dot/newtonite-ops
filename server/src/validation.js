@@ -12,8 +12,8 @@ export const schemas = {
     status: z.enum(statuses).optional(),
     priority: z.enum(priorities).optional(),
     type: z.enum(itemTypes).optional(),
-    teamId: z.string().optional(),
-    assigneeId: z.string().optional(),
+    teamId: z.string().min(1).max(64).optional(),
+    assigneeId: z.string().min(1).max(64).optional(),
     scope: z.enum(["mine", "unassignedUrgent", "approval"]).optional(),
     page: z.coerce.number().int().min(1).default(1),
     pageSize: z.coerce.number().int().min(1).max(50).default(10),
@@ -25,8 +25,8 @@ export const schemas = {
     description: z.string().trim().min(1).max(5000),
     type: z.enum(itemTypes),
     priority: z.enum(priorities).default("MEDIUM"),
-    teamId: z.string().min(1),
-    assigneeId: z.string().nullable().optional(),
+    teamId: z.string().min(1).max(64),
+    assigneeId: z.string().min(1).max(64).nullable().optional(),
     dueDate: z.string().datetime().nullable().optional()
   }),
   update: z.object({
@@ -38,7 +38,8 @@ export const schemas = {
     dueDate: z.string().datetime().nullable().optional()
   }).refine((body) => Object.keys(body).some((key) => key !== "version"), "Provide at least one field to update."),
   status: z.object({ version: z.number().int().min(1), status: z.enum(statuses) }),
-  assignment: z.object({ version: z.number().int().min(1), assigneeId: z.string().nullable() }),
+  assignment: z.object({ version: z.number().int().min(1), assigneeId: z.string().min(1).max(64).nullable() }),
+  itemId: z.object({ id: z.string().min(1).max(64) }),
   comment: z.object({ body: z.string().trim().min(1).max(2000) })
 };
 

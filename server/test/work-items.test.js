@@ -43,6 +43,16 @@ function makePrisma({ role = "MEMBER", member = true } = {}) {
       findMany: vi.fn(async () => member ? [{ teamId: item.teamId, role }] : [])
     },
     workItem: {
+      create: vi.fn(async ({ data }) => ({
+        ...item,
+        ...data,
+        id: "created-item",
+        status: "OPEN",
+        version: 1,
+        team: { id: data.teamId, name: "Operations" },
+        assignee: null,
+        creator: user
+      })),
       findUnique: vi.fn(async () => ({ ...state.item })),
       findMany: vi.fn(async ({ where }) => where.teamId?.in?.length === 0 ? [] : [state.item]),
       count: vi.fn(async ({ where }) => where.teamId?.in?.length === 0 ? 0 : 1),
@@ -90,6 +100,15 @@ describe("mocked API route tests — not PostgreSQL integration tests", () => {
   it("rejects requests without a valid authenticated account", async () => {
     const response = await request(app).get("/api/items/item-1");
     expect(response.status).toBe(401);
+  });
+
+  it("rejects oversized work-item identifiers before querying the item", async () => {
+    const response = await request(app).get(`/api/items/${"x".repeat(65)}`)
+      .set("Authorization", `Bearer ${tokenFor()}`);
+
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe("VALIDATION_ERROR");
+    expect(prisma.workItem.findUnique).not.toHaveBeenCalled();
   });
 
   it("returns a client error for malformed JSON", async () => {
@@ -237,6 +256,58 @@ describe("mocked API route tests — not PostgreSQL integration tests", () => {
     expect(response.body.items).toEqual([]);
   });
 
+  it("creates a work item and records its creator in the same transaction", async () => {
+    const response = await request(app).post("/api/items")
+      .set("Authorization", `Bearer ${tokenFor()}`)
+      .send({
+        title: "Investigate service latency",
+        description: "Review the recent deployment.",
+        type: "GENERAL_TASK",
+        teamId: "team-ops"
+      });
+
+    expect(response.status).toBe(201);
+    expect(response.body.item).toMatchObject({
+      id: "created-item",
+      title: "Investigate service latency",
+      creatorId: user.id,
+      priority: "MEDIUM",
+      status: "OPEN"
+    });
+    expect(prisma.$transaction).toHaveBeenCalledOnce();
+    expect(prisma.workItem.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        title: "Investigate service latency",
+        teamId: "team-ops",
+        creatorId: user.id
+      })
+    }));
+    expect(prisma.activity.create).toHaveBeenCalledWith({
+      data: {
+        itemId: "created-item",
+        actorId: user.id,
+        action: "created",
+        details: { status: "OPEN", priority: "MEDIUM" }
+      }
+    });
+  });
+
+  it("rejects an invalid idempotency key before creating a work item", async () => {
+    const response = await request(app).post("/api/items")
+      .set("Authorization", `Bearer ${tokenFor()}`)
+      .set("Idempotency-Key", "k".repeat(129))
+      .send({
+        title: "Investigate service latency",
+        description: "Review the recent deployment.",
+        type: "GENERAL_TASK",
+        teamId: "team-ops"
+      });
+
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe("VALIDATION_ERROR");
+    expect(prisma.workItem.create).not.toHaveBeenCalled();
+  });
+
   it("does not allow a Viewer to add comments", async () => {
     prisma = makePrisma({ role: "VIEWER" });
     app = createApp(prisma);
@@ -343,6 +414,55 @@ describe("mocked API route tests — not PostgreSQL integration tests", () => {
     });
   });
 
+  it("records changed fields and the responsible actor for item edits", async () => {
+    const dueDate = "2026-11-01T12:00:00.000Z";
+    const response = await request(app).patch("/api/items/item-1")
+      .set("Authorization", `Bearer ${tokenFor()}`)
+      .send({
+        version: 1,
+        title: "Updated incident",
+        description: "Updated investigation notes",
+        type: "CUSTOMER_ISSUE",
+        dueDate
+      });
+
+    expect(response.status).toBe(200);
+    expect(prisma.$transaction).toHaveBeenCalledOnce();
+    expect(prisma.activity.create).toHaveBeenCalledTimes(4);
+    expect(prisma.activity.create).toHaveBeenCalledWith({
+      data: {
+        itemId: "item-1",
+        actorId: user.id,
+        action: "title_changed",
+        details: { from: item.title, to: "Updated incident" }
+      }
+    });
+    expect(prisma.activity.create).toHaveBeenCalledWith({
+      data: {
+        itemId: "item-1",
+        actorId: user.id,
+        action: "description_changed",
+        details: { field: "description" }
+      }
+    });
+    expect(prisma.activity.create).toHaveBeenCalledWith({
+      data: {
+        itemId: "item-1",
+        actorId: user.id,
+        action: "type_changed",
+        details: { from: "INCIDENT", to: "CUSTOMER_ISSUE" }
+      }
+    });
+    expect(prisma.activity.create).toHaveBeenCalledWith({
+      data: {
+        itemId: "item-1",
+        actorId: user.id,
+        action: "due_date_changed",
+        details: { from: null, to: dueDate }
+      }
+    });
+  });
+
   it("records assignment activity with the actor and new assignee", async () => {
     const response = await request(app).patch("/api/items/item-1/assignment")
       .set("Authorization", `Bearer ${tokenFor()}`)
@@ -358,6 +478,15 @@ describe("mocked API route tests — not PostgreSQL integration tests", () => {
         details: { from: null, to: secondUser.name }
       }
     });
+  });
+
+  it("does not record assignment activity when the assignee is unchanged", async () => {
+    const response = await request(app).patch("/api/items/item-1/assignment")
+      .set("Authorization", `Bearer ${tokenFor()}`)
+      .send({ assigneeId: null, version: 1 });
+
+    expect(response.status).toBe(200);
+    expect(prisma.activity.create).not.toHaveBeenCalled();
   });
 
   it("simulates two concurrent claim requests with a mocked database", async () => {

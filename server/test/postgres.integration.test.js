@@ -7,8 +7,13 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@prisma/client";
 import pg from "pg";
 import { createApp } from "../src/app.js";
+import { assertSeparateTestDatabase } from "../src/database-target.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
+if (databaseUrl) {
+  assertSeparateTestDatabase(databaseUrl, process.env.DATABASE_URL, process.env.DEVELOPMENT_DATABASE_URL);
+}
+
 const integration = databaseUrl ? describe : describe.skip;
 // This signing key is only for local integration requests and is not an application credential.
 const signingSecret = "postgres-integration-test-secret-change-me";
@@ -151,6 +156,139 @@ integration("PostgreSQL-backed API integration tests", () => {
     expect(result.body.code).toBe("STALE_VERSION");
     expect(await prisma.workItem.findUnique({ where: { id: staleItem.id } })).toMatchObject({ title: staleItem.title, version: 2 });
     expect(await prisma.activity.count({ where: { itemId: staleItem.id } })).toBe(0);
+  });
+
+  it("persists item-edit history with the authenticated actor in PostgreSQL", async () => {
+    const result = await request(app).patch(`/api/items/${staleItem.id}`)
+      .set(authorized(member.id))
+      .send({ version: 2, title: "Updated integration title", description: "Revised integration notes" });
+
+    expect(result.status).toBe(200);
+    expect(await prisma.activity.findMany({
+      where: { itemId: staleItem.id },
+      orderBy: { action: "asc" }
+    })).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        actorId: member.id,
+        action: "title_changed",
+        details: { from: staleItem.title, to: "Updated integration title" }
+      }),
+      expect.objectContaining({
+        actorId: member.id,
+        action: "description_changed",
+        details: { field: "description" }
+      })
+    ]));
+    expect(await prisma.workItem.findUnique({ where: { id: staleItem.id } })).toMatchObject({ version: 3 });
+  });
+
+  it("creates and retrieves comments for an authorized team member", async () => {
+    const created = await request(app).post(`/api/items/${openItem.id}/comments`)
+      .set(authorized(member.id))
+      .send({ body: "Investigating the issue now." });
+    const details = await request(app).get(`/api/items/${openItem.id}`).set(authorized(member.id));
+
+    expect(created.status).toBe(201);
+    expect(created.body.comment).toMatchObject({ body: "Investigating the issue now.", authorId: member.id });
+    expect(details.status).toBe(200);
+    expect(details.body.comments).toEqual(expect.arrayContaining([
+      expect.objectContaining({ body: "Investigating the issue now.", authorId: member.id })
+    ]));
+  });
+
+  it("creates a work item and its creator activity in PostgreSQL", async () => {
+    const created = await request(app).post("/api/items")
+      .set(authorized(member.id))
+      .send({
+        title: `Created ${randomUUID()}`,
+        description: "Created by the integration route.",
+        type: "GENERAL_TASK",
+        teamId: team.id
+      });
+
+    expect(created.status).toBe(201);
+    expect(created.body.item.creatorId).toBe(member.id);
+    expect(await prisma.activity.findMany({ where: { itemId: created.body.item.id } })).toEqual([
+      expect.objectContaining({
+        actorId: member.id,
+        action: "created",
+        details: { status: "OPEN", priority: "MEDIUM" }
+      })
+    ]);
+  });
+
+  it("replays item creation for the same key and rejects a different payload", async () => {
+    const key = randomUUID();
+    const payload = {
+      title: `Idempotent ${randomUUID()}`,
+      description: "Created with an idempotency key.",
+      type: "GENERAL_TASK",
+      teamId: team.id
+    };
+    const first = await request(app).post("/api/items").set(authorized(member.id))
+      .set("Idempotency-Key", key).send(payload);
+    const retry = await request(app).post("/api/items").set(authorized(member.id))
+      .set("Idempotency-Key", key).send(payload);
+    const mismatch = await request(app).post("/api/items").set(authorized(member.id))
+      .set("Idempotency-Key", key).send({ ...payload, title: `${payload.title} changed` });
+
+    expect(first.status).toBe(201);
+    expect(retry.status).toBe(201);
+    expect(retry.body).toEqual(first.body);
+    expect(mismatch.status).toBe(409);
+    expect(mismatch.body.code).toBe("IDEMPOTENCY_KEY_REUSED");
+    expect(await prisma.activity.count({ where: { itemId: first.body.item.id, action: "created" } })).toBe(1);
+  });
+
+  it("creates only one item for concurrent requests with the same key", async () => {
+    const key = randomUUID();
+    const payload = {
+      title: `Concurrent idempotent ${randomUUID()}`,
+      description: "Concurrent duplicate request.",
+      type: "GENERAL_TASK",
+      teamId: team.id
+    };
+    const results = await Promise.all([
+      request(app).post("/api/items").set(authorized(member.id)).set("Idempotency-Key", key).send(payload),
+      request(app).post("/api/items").set(authorized(member.id)).set("Idempotency-Key", key).send(payload)
+    ]);
+
+    expect(results.map(({ status }) => status)).toEqual([201, 201]);
+    expect(results[1].body).toEqual(results[0].body);
+    expect(await prisma.activity.count({ where: { itemId: results[0].body.item.id, action: "created" } })).toBe(1);
+  });
+
+  it("replays comment creation for the same key and rejects a different payload", async () => {
+    const key = randomUUID();
+    const payload = { body: "Comment created with an idempotency key." };
+    const first = await request(app).post(`/api/items/${openItem.id}/comments`)
+      .set(authorized(member.id)).set("Idempotency-Key", key).send(payload);
+    const retry = await request(app).post(`/api/items/${openItem.id}/comments`)
+      .set(authorized(member.id)).set("Idempotency-Key", key).send(payload);
+    const mismatch = await request(app).post(`/api/items/${openItem.id}/comments`)
+      .set(authorized(member.id)).set("Idempotency-Key", key).send({ body: "A different comment." });
+
+    expect(first.status).toBe(201);
+    expect(retry.status).toBe(201);
+    expect(retry.body).toEqual(first.body);
+    expect(mismatch.status).toBe(409);
+    expect(mismatch.body.code).toBe("IDEMPOTENCY_KEY_REUSED");
+    expect(await prisma.comment.count({ where: { itemId: openItem.id, body: payload.body } })).toBe(1);
+  });
+
+  it("creates only one comment for concurrent requests with the same key", async () => {
+    const key = randomUUID();
+    const payload = { body: "Concurrent idempotent comment." };
+    const results = await Promise.all([
+      request(app).post(`/api/items/${openItem.id}/comments`)
+        .set(authorized(member.id)).set("Idempotency-Key", key).send(payload),
+      request(app).post(`/api/items/${openItem.id}/comments`)
+        .set(authorized(member.id)).set("Idempotency-Key", key).send(payload)
+    ]);
+
+    expect(results.map(({ status }) => status)).toEqual([201, 201]);
+    expect(results[1].body).toEqual(results[0].body);
+    expect(await prisma.comment.count({ where: { itemId: openItem.id, body: payload.body } })).toBe(1);
   });
 
   it("lets exactly one of two concurrent PostgreSQL claims succeed and records one activity", async () => {

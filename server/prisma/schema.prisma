@@ -46,6 +46,7 @@ model User {
   assignments  WorkItem[]   @relation("Assignments")
   activities   Activity[]
   comments     Comment[]
+  idempotencyRecords IdempotencyRecord[]
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
 }
@@ -121,4 +122,17 @@ model Comment {
   createdAt DateTime @default(now())
 
   @@index([itemId, createdAt])
+}
+
+model IdempotencyRecord {
+  id             String   @id @default(cuid())
+  actorId        String
+  scope          String
+  idempotencyKey String
+  requestHash    String
+  response       Json?
+  actor          User     @relation(fields: [actorId], references: [id], onDelete: Cascade)
+  createdAt      DateTime @default(now())
+
+  @@unique([actorId, scope, idempotencyKey])
 }

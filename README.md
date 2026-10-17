@@ -10,11 +10,11 @@ A small internal operations workspace for teams to create, assign, prioritize, a
 - [x] Hashed demo passwords (configurable with `DEMO_PASSWORD`), signed expiring JWTs, database-backed team membership/role checks, and resource-level team access checks.
 - [x] Work item types, priorities, explicit workflow, comments, append-only activity events, filtering, search, sorting, and database pagination.
 - [x] Conditional atomic claim; optimistic version checks return `409`; approval requires a team Lead or Admin.
-- [x] Client dashboard with queue filters, server-derived metrics, details/timeline/comments, claim/assignment, status controls, and create/edit forms.
+- [x] Audited field changes and actor attribution; edit and approval activity writes share a transaction with their work-item update.
+- [x] Client dashboard with queue filters, server-derived metrics, details/timeline/comments, role-aware mutation controls, conflict reconciliation, claim/assignment, and create/edit forms.
 - [x] Mocked API tests for authentication, team access, approval authorization, invalid transitions, stale versions, and competing claim requests.
-- [x] Opt-in PostgreSQL-backed integration tests for cross-team access, role enforcement, workflow, stale versions, and competing claims.
+- [x] Opt-in PostgreSQL-backed integration tests for cross-team access, role enforcement, workflow, comments, audit history, stale versions, and competing claims.
 - [x] Setup and decision documentation.
-- [x] Run the checked-in migration and demo seed against local PostgreSQL; run all five PostgreSQL integration tests against a separate disposable database.
 - [ ] Verify the browser workflow end to end. The automated API tests do not replace a manual browser walkthrough.
 
 ## Prerequisites
@@ -98,8 +98,10 @@ Only a Lead or Admin of the item's team can approve `Awaiting Approval → Resol
 
 - **Concurrent claims:** the API uses an `UPDATE ... WHERE assigneeId IS NULL` via Prisma `updateMany` inside a transaction. PostgreSQL serializes competing row updates and rechecks the predicate, so only one claim can succeed. Only that successful transaction writes the assignment activity.
 - **Stale edits:** editable work-item fields carry the version seen by the client. The write matches both the item ID and version and increments the version atomically. If a different request updated it first, the match count is zero and the API returns `409 STALE_VERSION`.
+- **Audit history:** changed work-item fields create actor-attributed activity records in the same transaction as the versioned update. If activity persistence fails, the item update rolls back. Descriptions are recorded as changed without copying their potentially long contents into the activity log.
 - **Workflow/authorization:** every item route checks team membership; edit/assignment actions check the membership role; transition edges and approval permissions are validated server-side.
-- **Retry behavior:** competing claim retries return a conflict and never add a second assignment activity. Comments intentionally create a new comment for every accepted POST; clients should not automatically retry comment submissions.
+- **Retry behavior:** competing claim retries return a conflict and never add a second assignment activity. Versioned writes reject repeats with a conflict. Item creation and comment POSTs accept an `Idempotency-Key` header; a repeated key with the same authenticated actor, operation, and payload replays the original response, while a different payload returns `409 IDEMPOTENCY_KEY_REUSED`. The key and response are stored in PostgreSQL in the same transaction as the mutation, so concurrent duplicate requests create only one item/comment. The UI reuses a key when retrying an unchanged submission in the same page session and creates a new key when its payload changes. Requests without the header retain the legacy non-idempotent behavior.
+- **Client conflict handling:** a stale edit closes the outdated form, reloads the latest item, and asks the user to review it before editing again. The client also refreshes after stale assignment or workflow requests. Viewer controls are hidden in the UI, with API role checks remaining authoritative.
 
 ## REST API overview
 
@@ -112,13 +114,15 @@ All routes are prefixed with `/api`; protected routes require `Authorization: Be
 | `GET /auth/me` | Current user and team memberships |
 | `GET /teams`, `GET /members` | Teams and members visible to the current user |
 | `GET /items` | Search/filter/sort/page items; accepts `q`, `status`, `priority`, `type`, `teamId`, `assigneeId`, `scope`, `page`, `pageSize`, `sortBy`, and `order` |
-| `POST /items` | Create an item in a team where the actor can create work |
+| `POST /items` | Create an item in a team where the actor can create work; supports the `Idempotency-Key` header |
 | `GET /items/:id` | Item detail, activity timeline, and comments (team members only) |
 | `PATCH /items/:id` | Edit supported fields using `{ "version": 1, ... }` |
 | `PATCH /items/:id/status` | Transition using `{ "version": 1, "status": "IN_PROGRESS" }` |
 | `PATCH /items/:id/assignment` | Assign or unassign using `{ "version": 1, "assigneeId": "..." }` |
 | `POST /items/:id/claim` | Atomically claim an unassigned item for the current user |
-| `POST /items/:id/comments` | Add `{ "body": "..." }` |
+| `POST /items/:id/comments` | Add `{ "body": "..." }`; supports the `Idempotency-Key` header |
+
+`POST /items` also supports the optional `Idempotency-Key` header. Keys are scoped to the authenticated user and endpoint (including the item for comment requests). Keep the same key for retries of the same request; use a new key for a new logical operation. Reusing a key with a different validated payload returns `409 IDEMPOTENCY_KEY_REUSED`.
 
 Responses use JSON. Validation errors are `400`, unauthenticated requests `401`, forbidden actions `403`, missing resources `404`, stale writes/claim conflicts `409`, and unexpected server errors `500` without database details in the response.
 
@@ -133,38 +137,51 @@ npm run build
 The regular backend route tests use a Prisma-shaped test double. Their concurrent-claim case is a mocked simulation and **does not verify PostgreSQL concurrency**. The separate `server/test/postgres.integration.test.js` suite uses two simultaneous HTTP requests against a real PostgreSQL database, and is skipped unless `TEST_DATABASE_URL` is set. Use a disposable, migrated database for this suite. Example PowerShell commands, after PostgreSQL is available:
 
 ```powershell
-$env:DATABASE_URL = "postgresql://ops_user:change_me@localhost:5432/operations_under_pressure_test?schema=public"
-npm run db:generate
-npm run db:migrate
-$env:TEST_DATABASE_URL = $env:DATABASE_URL
+$env:TEST_DATABASE_URL = "postgresql://<test-user>:<test-password>@<test-host>:5432/operations_under_pressure_test?schema=public"
+$previousDatabaseUrl = $env:DATABASE_URL
+Push-Location server
+$env:DATABASE_URL = $env:TEST_DATABASE_URL
+npx prisma migrate deploy
+if ($null -eq $previousDatabaseUrl) { Remove-Item Env:DATABASE_URL } else { $env:DATABASE_URL = $previousDatabaseUrl }
+Pop-Location
 npm run test --workspace=server
 npm run test --workspace=client
 npm run build
+Remove-Item Env:TEST_DATABASE_URL
 ```
 
-The integration suite creates uniquely named users, teams, memberships, and items, then removes those records. Do not point it at a production database. It tests authorization across teams and roles, workflow transitions, stale writes, and simultaneous PostgreSQL claims. The browser workflow still requires manually starting `npm run dev` and signing in through a browser; it is not an automated browser test.
+The integration suite uses only `TEST_DATABASE_URL`, creates uniquely named users, teams, memberships, and items, then deletes records by the UUIDs created by that run. It does not truncate, reset, seed, or drop a database. The suite is skipped if `TEST_DATABASE_URL` is unset. If it is set, the suite checks before connecting that at least one development URL is configured, every configured `DATABASE_URL` and `DEVELOPMENT_DATABASE_URL` is valid, and the test URL matches neither development URL after normalizing loopback aliases, default PostgreSQL ports, and database names; otherwise it fails closed. Still use only a dedicated disposable database; do not point it at a production database. It tests authorization across teams and roles, workflow transitions, stale writes, and simultaneous PostgreSQL claims.
+
+### Manual browser checklist
+
+The application browser workflow has not been automated. The project owner reports manual browser checks succeeded for creating and editing work items, claiming and assigning them, starting work, recording activity, and adding comments. This review did not repeat those browser checks; it also has no reported manual result for approval or stale-conflict flows. To verify the remaining paths locally:
+
+1. Start PostgreSQL and the application using the local setup above, then sign in as `member@newtonite.demo` with the configured `DEMO_PASSWORD`.
+2. Create a work item and confirm it appears in the queue; open it, claim it, add a comment, and confirm the comment and actor appear in the item detail.
+3. Move it from Open to In Progress, then request approval. Sign in as `lead@newtonite.demo` and approve the item from Awaiting Approval to Resolved.
+4. Sign in as `viewer@newtonite.demo`; confirm create, edit, assignment, claim, comment, and workflow controls are absent. Verify that attempts to call protected mutations through the API return `403`.
+5. Open the same item in two sessions. Save an edit in the first session, then submit a stale edit in the second; confirm it is rejected and the latest detail is loaded.
+6. Open one unassigned item in two member sessions and claim at nearly the same time; verify only one succeeds and the other receives a conflict.
 
 ### Verification status for this workspace
 
-Checked on 16 October 2026:
+Checked on 17 October 2026:
 
-- `npx prisma validate`: passed.
-- `npm run db:migrate` against the local demo database: passed; migration `20261016000000_init` applied.
-- `npm run db:seed` against the local demo database: passed; verified 5 users, 2 teams, and 5 work items.
-- `npm run db:migrate` against the separately created local test database: passed.
-- `npm run test --workspace=server -- postgres.integration.test.js`: **5 passed** against the isolated PostgreSQL test database, including two concurrent claim requests.
-- `npm test`: **29 server tests passed** (24 mocked API tests and 5 PostgreSQL integration tests), **2 client tests passed**, none skipped.
+- `npm run db:generate` and `npx prisma validate`: passed.
+- `npm run test --workspace=server -- test/postgres.integration.test.js`: **12 passed, 0 skipped, 0 failed** against the isolated PostgreSQL test database, including retry, payload-mismatch, and concurrent duplicate-request cases for item and comment creation.
+- `npm test`: server **48 passed, 0 skipped, 0 failed** (including all 12 PostgreSQL integration tests); client **8 passed, 0 skipped, 0 failed**.
 - `npm run build`: passed.
-- `npm run db:generate`: passed.
-- `npm audit --audit-level=moderate`: zero reported vulnerabilities.
-- Mocked coverage includes database lookup failures returning sanitized `500` errors, stale workflow updates returning `409`, database query construction for search and filters, priority/assignment activity recording, comment creation and timeline reads, and database-independent health checks. Mock tests do not establish database transaction or concurrency behavior.
-- The integration suite created uniquely named records and removed them; post-test counts in the disposable test database were zero users, zero teams, and zero work items. The test database itself remains in the local Docker volume.
-- Browser end-to-end workflow: **not run**.
+- `npx prisma migrate deploy` applied the committed `20261016000000_init` and `20261017000000_idempotency_records` migrations only to the isolated PostgreSQL 16 test database at `127.0.0.1:55432/operations_under_pressure_test`, on its own Docker volume. The container is stopped and its volume retained.
+- Integration-test cleanup left zero test users, teams, work items, activities, comments, and idempotency records. The full test run used the isolated test database; development database coordinates were verified distinct and no development database writes were made.
+- No seed, reset, truncate, database drop, existing-volume removal, or development-database migration was run.
+- Manual browser checks reported by the project owner: create/edit/claim/assign/start-work/activity/comments succeeded. This review did not independently repeat them.
+
+The test service was created for this verification only. The disposable integration database is separate from the development endpoint and database; the safety guard compares normalized host, default port, and database name before integration tests run.
 
 ## Known limitations
 
 - No production identity provider, password reset, self-registration, or persistent server-side session revocation.
 - No user-facing team administration or team-creation screen; seed data defines the demo teams and membership roles.
-- No comment idempotency key; a deliberate/retried comment POST creates another comment.
-- Browser end-to-end workflow has not been verified. PostgreSQL-backed API tests passed against local Docker PostgreSQL bound to `127.0.0.1:5432`; a manual browser walkthrough remains to be done.
+- The `Idempotency-Key` header is optional for API callers; requests without it remain non-idempotent. The browser retains retry keys in memory for the current page session, so a retry after a page reload must reuse the original key explicitly. Idempotency response records are retained until the associated user is deleted; there is no expiry cleanup.
+- Browser checks are manual, not automated; approval and stale-conflict browser behavior remain unconfirmed here. A PostgreSQL integration run requires a separately configured disposable test database.
 - The documented seed-password fallback and Compose database credentials are local-demo defaults only. Override them through environment variables and never reuse them for a deployed or sensitive database.

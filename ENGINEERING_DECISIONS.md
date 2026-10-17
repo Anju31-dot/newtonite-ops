@@ -33,4 +33,16 @@
 - **Context:** Two operators may claim one unassigned item, and users can edit details from stale browser views.
 - **Alternatives:** Read-then-write assignment, last-write-wins edits, or extra queueing infrastructure.
 - **Chosen approach:** Claim is a single conditional database update (`assigneeId IS NULL`) inside a transaction that also writes the activity entry. Edits match the submitted version and increment it atomically; zero matched rows returns `409 Conflict`. Mocked route tests cover these responses; a separate opt-in integration suite exercises real PostgreSQL behavior when `TEST_DATABASE_URL` points to a migrated disposable database.
-- **Trade-offs:** PostgreSQL provides the serialization point with no additional service. Clients must handle `409` by refreshing and reconciling the latest item. The separate PostgreSQL integration suite, including two competing HTTP claim requests, passed against a disposable local test database on 16 October 2026. Mocked tests alone are not evidence of real database concurrency; this local run is not a production deployment validation.
+- **Trade-offs:** PostgreSQL provides the serialization point with no additional service. Clients must handle `409` by refreshing and reconciling the latest item. During the 17 October 2026 pre-submission review, the PostgreSQL integration suite passed against a newly created, loopback-only PostgreSQL 16 test service on its own Docker volume; the development database endpoint and row counts were unchanged. This local verification is not a production deployment validation.
+
+## 6. Audited updates and role-aware controls
+
+- **Context:** Operators need to know which item fields changed and who made a change, while read-only users should not be offered controls that the API will reject.
+- **Chosen approach:** Every changed work-item field creates an actor-attributed activity record in the same Prisma transaction as the version-checked update. The client refreshes item details after a `409` conflict and only renders mutation controls for users with an editable team role; approval remains Lead/Admin-only in both the UI and API.
+- **Trade-offs:** Description activity records identify the changed field without copying potentially long or sensitive text into the audit payload. UI role checks improve usability but are not an authorization boundary; server membership checks remain mandatory.
+
+## 7. Persistent idempotency for create requests
+
+- **Context:** Retried item and comment creation requests must not produce duplicate records, including when requests race across API processes.
+- **Chosen approach:** When a client supplies `Idempotency-Key`, a PostgreSQL record is uniquely scoped by authenticated actor and operation. The request hash, stored response, created item/comment, and item activity are committed together in a transaction. PostgreSQL's unique constraint arbitrates concurrent requests; matching retries replay the stored response, and key reuse with a different validated payload returns `409`.
+- **Trade-offs:** The header remains optional for compatibility, so callers must reuse a key to receive retry safety. Response snapshots remain stored until the actor is deleted; no expiry or cleanup worker is included.

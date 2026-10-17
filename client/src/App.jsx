@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api.js";
 
 const initialFilters = { q: "", status: "", priority: "", type: "", assigneeId: "", scope: "" };
@@ -10,8 +10,16 @@ const typeLabels = {
   GENERAL_TASK: "General task"
 };
 const statusLabels = { OPEN: "Open", IN_PROGRESS: "In progress", AWAITING_APPROVAL: "Awaiting approval", RESOLVED: "Resolved", CLOSED: "Closed" };
-const roleNames = { VIEWER: "Viewer", MEMBER: "Member", LEAD: "Lead", ADMIN: "Admin" };
+const editableRoles = ["MEMBER", "LEAD", "ADMIN"];
 const shortDate = (value) => value ? new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(new Date(value)) : "No due date";
+
+function idempotencyHeader(reference, payload) {
+  const serialized = JSON.stringify(payload);
+  if (!reference.current || reference.current.payload !== serialized) {
+    reference.current = { payload: serialized, key: globalThis.crypto.randomUUID() };
+  }
+  return { "Idempotency-Key": reference.current.key };
+}
 
 function Login({ onLogin, error }) {
   const [email, setEmail] = useState("member@newtonite.demo");
@@ -64,9 +72,16 @@ function App() {
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
   const [comment, setComment] = useState("");
+  const commentSubmission = useRef(null);
+  const createSubmission = useRef(null);
+  const [commenting, setCommenting] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [editing, setEditing] = useState(false);
+  const canCreate = teams.some((team) => editableRoles.includes(team.role));
+  const selectedRole = detail && teams.find((team) => team.id === detail.item.teamId)?.role;
+  const canWorkOnSelected = editableRoles.includes(selectedRole);
+  const canApproveSelected = ["LEAD", "ADMIN"].includes(selectedRole);
 
   const queryString = useMemo(() => {
     const query = new URLSearchParams({
@@ -145,6 +160,27 @@ function App() {
     setFilters((current) => ({ ...current, [key]: value }));
   }
 
+  async function refreshSelectedItem() {
+    if (!selected) return;
+    const fresh = await api(`/items/${selected.id}`, { token });
+    setDetail(fresh);
+    setSelected(fresh.item);
+    return fresh;
+  }
+
+  async function reconcileConflict() {
+    await loadItems();
+    try {
+      const fresh = await refreshSelectedItem();
+      if (fresh) {
+        setEditing(false);
+        setToast("This item changed elsewhere. The latest version is loaded; review it before trying again.");
+      }
+    } catch (refreshError) {
+      setToast(`Your change was not saved, and the latest item could not be loaded: ${refreshError.message}`);
+    }
+  }
+
   async function runAction(path, body, success) {
     try {
       await api(path, { token, method: body ? "PATCH" : "POST", ...(body ? { body: JSON.stringify(body) } : {}) });
@@ -157,14 +193,10 @@ function App() {
       }
       window.setTimeout(() => setToast(""), 3000);
     } catch (actionError) {
-      setToast(actionError.message);
       if (actionError.status === 409) {
-        await loadItems();
-        if (selected) {
-          const fresh = await api(`/items/${selected.id}`, { token });
-          setDetail(fresh);
-          setSelected(fresh.item);
-        }
+        await reconcileConflict();
+      } else {
+        setToast(actionError.message);
       }
     }
   }
@@ -172,14 +204,24 @@ function App() {
   async function addComment(event) {
     event.preventDefault();
     if (!comment.trim() || !selected) return;
+    setCommenting(true);
     try {
-      await api(`/items/${selected.id}/comments`, { token, method: "POST", body: JSON.stringify({ body: comment }) });
+      const body = { body: comment };
+      await api(`/items/${selected.id}/comments`, {
+        token,
+        method: "POST",
+        body: JSON.stringify(body),
+        headers: idempotencyHeader(commentSubmission, body)
+      });
+      commentSubmission.current = null;
       setComment("");
       setDetail(await api(`/items/${selected.id}`, { token }));
       setToast("Comment added.");
       window.setTimeout(() => setToast(""), 2500);
     } catch (actionError) {
       setToast(actionError.message);
+    } finally {
+      setCommenting(false);
     }
   }
 
@@ -188,14 +230,21 @@ function App() {
     setCreating(true);
     const form = event.currentTarget;
     const data = new FormData(form);
+    const body = {
+      title: data.get("title"),
+      description: data.get("description"),
+      type: data.get("type"),
+      priority: data.get("priority"),
+      teamId: data.get("teamId")
+    };
     try {
-      const response = await api("/items", { token, method: "POST", body: JSON.stringify({
-        title: data.get("title"),
-        description: data.get("description"),
-        type: data.get("type"),
-        priority: data.get("priority"),
-        teamId: data.get("teamId")
-      }) });
+      const response = await api("/items", {
+        token,
+        method: "POST",
+        body: JSON.stringify(body),
+        headers: idempotencyHeader(createSubmission, body)
+      });
+      createSubmission.current = null;
       setCreateOpen(false);
       form.reset();
       setToast("Work item created.");
@@ -227,10 +276,22 @@ function App() {
       setDetail({ ...detail, item: response.item });
       setSelected(response.item);
       await loadItems();
+      try {
+        const fresh = await api(`/items/${response.item.id}`, { token });
+        setDetail(fresh);
+        setSelected(fresh.item);
+      } catch (refreshError) {
+        setToast(`Work item updated, but its latest activity could not be loaded: ${refreshError.message}`);
+        return;
+      }
       setToast("Work item updated.");
       window.setTimeout(() => setToast(""), 2500);
     } catch (updateError) {
-      setToast(updateError.message);
+      if (updateError.status === 409) {
+        await reconcileConflict();
+      } else {
+        setToast(updateError.message);
+      }
     } finally {
       setCreating(false);
     }
@@ -252,9 +313,9 @@ function App() {
       </aside>
 
       <main className="main-area">
-        <header className="topbar"><div className="breadcrumb">Workspace <span>/</span> <strong>Operations</strong></div><div className="top-actions"><span className="live-pill"><i /> LIVE</span><button className="button primary" onClick={() => setCreateOpen(true)}>＋ New work item</button></div></header>
+        <header className="topbar"><div className="breadcrumb">Workspace <span>/</span> <strong>Operations</strong></div><div className="top-actions">{canCreate && <button className="button primary" onClick={() => setCreateOpen(true)}>＋ New work item</button>}</div></header>
         <section className="page-content">
-          <div className="page-heading"><div><p className="eyebrow">MONDAY, OCTOBER 19, 2026 <span>·</span> GOOD MORNING</p><h1>Operations overview</h1><p className="muted">The right work, in the right hands, at the right time.</p></div><div className="heading-meta"><div className="avatar-stack"><span>JM</span><span>SP</span><span>CR</span><b>+4</b></div><small>TEAM WORKSPACE</small></div></div>
+          <div className="page-heading"><div><p className="eyebrow">{new Intl.DateTimeFormat("en", { weekday: "long", month: "long", day: "numeric", year: "numeric" }).format(new Date()).toUpperCase()} <span>·</span> OPERATIONS</p><h1>Operations overview</h1><p className="muted">The right work, in the right hands, at the right time.</p></div><div className="heading-meta"><small>TEAM WORKSPACE</small></div></div>
           <div className="stat-grid">
             <div className="stat-card"><div className="stat-top">Open work <span className="stat-icon blue">▦</span></div><strong>{metrics.open}</strong><small>not yet closed</small><div className="stat-rule blue-rule" /></div>
             <div className="stat-card"><div className="stat-top">Urgent <span className="stat-icon red">↗</span></div><strong>{metrics.urgent}</strong><small>need attention now</small><div className="stat-rule red-rule" /></div>
@@ -303,15 +364,15 @@ function App() {
         <div className="drawer-top"><span className="eyebrow">WORK ITEM</span><button onClick={() => setSelected(null)} aria-label="Close details">×</button></div>
         {detailLoading || !detail ? <p className="muted drawer-loading">Loading item details…</p> : <><div className="drawer-title"><span className={`type-icon type-${detail.item.type.toLowerCase()}`}>ϟ</span><span className={`status status-${detail.item.status.toLowerCase().replaceAll("_", "-")}`}>{statusLabels[detail.item.status]}</span><span className={`priority priority-${detail.item.priority.toLowerCase()}`}><i /> {detail.item.priority[0] + detail.item.priority.slice(1).toLowerCase()}</span></div>
           <h2>{detail.item.title}</h2><p className="drawer-description">{detail.item.description}</p><div className="detail-facts"><div><small>TEAM</small><strong>{detail.item.team.name}</strong></div><div><small>ASSIGNEE</small><strong>{detail.item.assignee?.name || "Unassigned"}</strong></div><div><small>CREATED BY</small><strong>{detail.item.creator.name}</strong></div><div><small>DUE DATE</small><strong>{shortDate(detail.item.dueDate)}</strong></div><div><small>VERSION</small><strong>v{detail.item.version}</strong></div><div><small>TYPE</small><strong>{typeLabels[detail.item.type]}</strong></div></div>
-          {["MEMBER", "LEAD", "ADMIN"].includes(teams.find((team) => team.id === detail.item.teamId)?.role) && <button className="button secondary wide drawer-action" onClick={() => setEditing(true)}>Edit work item</button>}
-          {["MEMBER", "LEAD", "ADMIN"].includes(teams.find((team) => team.id === detail.item.teamId)?.role) && <label className="assignment-control">ASSIGNEE<select aria-label="Assign work item" value={detail.item.assigneeId || ""} onChange={(event) => runAction(`/items/${detail.item.id}/assignment`, { version: detail.item.version, assigneeId: event.target.value || null }, "Assignee updated.")}><option value="">Unassigned</option>{members.filter((member) => member.teamId === detail.item.teamId).map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>}
-          {detail.item.assigneeId === null && <button className="button primary wide drawer-action" onClick={() => runAction(`/items/${detail.item.id}/claim`, null, "You claimed this item.")}>Claim this item</button>}
-          {detail.item.status !== "CLOSED" && <div className="workflow-actions">{detail.item.status === "OPEN" && <button className="button secondary" onClick={() => runAction(`/items/${detail.item.id}/status`, { status: "IN_PROGRESS", version: detail.item.version }, "Work started.")}>Start work</button>}
+          {canWorkOnSelected && <button className="button secondary wide drawer-action" onClick={() => setEditing(true)}>Edit work item</button>}
+          {canWorkOnSelected && <label className="assignment-control">ASSIGNEE<select aria-label="Assign work item" value={detail.item.assigneeId || ""} onChange={(event) => runAction(`/items/${detail.item.id}/assignment`, { version: detail.item.version, assigneeId: event.target.value || null }, "Assignee updated.")}><option value="">Unassigned</option>{members.filter((member) => member.teamId === detail.item.teamId).map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label>}
+          {canWorkOnSelected && detail.item.assigneeId === null && <button className="button primary wide drawer-action" onClick={() => runAction(`/items/${detail.item.id}/claim`, null, "You claimed this item.")}>Claim this item</button>}
+          {canWorkOnSelected && detail.item.status !== "CLOSED" && <div className="workflow-actions">{detail.item.status === "OPEN" && <button className="button secondary" onClick={() => runAction(`/items/${detail.item.id}/status`, { status: "IN_PROGRESS", version: detail.item.version }, "Work started.")}>Start work</button>}
             {detail.item.status === "IN_PROGRESS" && <button className="button secondary" onClick={() => runAction(`/items/${detail.item.id}/status`, { status: "AWAITING_APPROVAL", version: detail.item.version }, "Sent for approval.")}>Request approval</button>}
-            {detail.item.status === "AWAITING_APPROVAL" && ["LEAD", "ADMIN"].includes(teams.find((team) => team.id === detail.item.teamId)?.role) && <button className="button primary" onClick={() => runAction(`/items/${detail.item.id}/status`, { status: "RESOLVED", version: detail.item.version }, "Item approved and resolved.")}>Approve & resolve</button>}
+            {detail.item.status === "AWAITING_APPROVAL" && canApproveSelected && <button className="button primary" onClick={() => runAction(`/items/${detail.item.id}/status`, { status: "RESOLVED", version: detail.item.version }, "Item approved and resolved.")}>Approve & resolve</button>}
             {detail.item.status === "RESOLVED" && <button className="button secondary" onClick={() => runAction(`/items/${detail.item.id}/status`, { status: "CLOSED", version: detail.item.version }, "Item closed.")}>Close item</button>}</div>}
           <section className="drawer-section"><h3>Activity <span>{detail.activities.length}</span></h3><div className="timeline">{detail.activities.map((activity) => <div className="timeline-entry" key={activity.id}><span className="timeline-dot" /><div><strong>{activity.actor.name}</strong> {activity.action.replaceAll("_", " ")}{activity.details?.from !== undefined && <span className="activity-change"> {activity.details.from || "Unassigned"} → {activity.details.to || "Unassigned"}</span>}<small>{new Date(activity.createdAt).toLocaleString()}</small></div></div>)}{detail.activities.length === 0 && <small>No activity recorded yet.</small>}</div></section>
-          <section className="drawer-section"><h3>Comments <span>{detail.comments.length}</span></h3><div className="comments">{detail.comments.map((entry) => <article className="comment" key={entry.id}><strong>{entry.author.name}</strong><small>{new Date(entry.createdAt).toLocaleString()}</small><p>{entry.body}</p></article>)}</div><form className="comment-form" onSubmit={addComment}><input value={comment} onChange={(event) => setComment(event.target.value)} placeholder="Write a comment…" aria-label="Write a comment" /><button className="button primary" disabled={!comment.trim()}>Send</button></form></section>
+          <section className="drawer-section"><h3>Comments <span>{detail.comments.length}</span></h3><div className="comments">{detail.comments.map((entry) => <article className="comment" key={entry.id}><strong>{entry.author.name}</strong><small>{new Date(entry.createdAt).toLocaleString()}</small><p>{entry.body}</p></article>)}</div>{canWorkOnSelected && <form className="comment-form" onSubmit={addComment}><input value={comment} onChange={(event) => setComment(event.target.value)} placeholder="Write a comment…" aria-label="Write a comment" /><button className="button primary" disabled={!comment.trim() || commenting}>{commenting ? "Sending…" : "Send"}</button></form>}</section>
         </>}
       </aside></div>}
 
@@ -319,7 +380,7 @@ function App() {
         <label>Title<input name="title" required minLength="3" maxLength="160" placeholder="What needs to get done?" defaultValue={editing ? detail?.item.title : ""} /></label><label>Description<textarea name="description" required rows="4" placeholder="Add the important context…" defaultValue={editing ? detail?.item.description : ""} /></label><div className="form-row"><label>Type<select name="type" defaultValue={editing ? detail?.item.type : "GENERAL_TASK"}>{Object.entries(typeLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label><label>Priority<select name="priority" defaultValue={editing ? detail?.item.priority : "MEDIUM"}>{["LOW", "MEDIUM", "HIGH", "URGENT"].map((value) => <option key={value} value={value}>{value[0] + value.slice(1).toLowerCase()}</option>)}</select></label></div>
         {editing ? <label>Due date<input name="dueDate" type="datetime-local" defaultValue={detail?.item.dueDate ? new Date(detail.item.dueDate).toISOString().slice(0, 16) : ""} /></label> : <label>Team<select name="teamId" required defaultValue={teams.find((team) => ["MEMBER", "LEAD", "ADMIN"].includes(team.role))?.id || ""}><option value="" disabled>Select a team</option>{teams.filter((team) => ["MEMBER", "LEAD", "ADMIN"].includes(team.role)).map((team) => <option key={team.id} value={team.id}>{team.name}</option>)}</select></label>}
         <div className="modal-actions"><button type="button" className="button secondary" onClick={() => { setCreateOpen(false); setEditing(false); }}>Cancel</button><button className="button primary" disabled={creating}>{editing ? "Save changes" : "Create item"}</button></div></form></section></div>}
-      {toast && <div className={`toast ${toast.toLowerCase().includes("could") || toast.toLowerCase().includes("changed") ? "toast-error" : ""}`} role="status">{toast}</div>}
+      {toast && <div className={`toast ${toast.toLowerCase().includes("could") || toast.toLowerCase().includes("changed") ? "toast-error" : ""}`} role="status" aria-live="polite">{toast}</div>}
     </div>
   );
 }
